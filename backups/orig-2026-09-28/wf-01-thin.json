@@ -1,0 +1,478 @@
+{
+  "name": "WF-01 Pipeline (thin)",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## WF-01 \u2014 thin orchestration (Track A)\nWebhook `tt-inbound-crm` \u2192 Normalize \u2192 Pre-pass note \u2192 Call agent service \u2192 Dispatch \u2192 Log\n\n- **No reasoning in n8n.** The agent service decides; this workflow only routes.\n- Agent service URL comes from env var `AGENT_SERVICE_URL` \u2014 nothing hardcoded.\n- Canonical message: `{message_id, channel, source, sender, body, timestamp}` (see README).\n\n### Stubbed / pending\n1. **Payload mapping unverified** \u2014 GHL + Close field names are best guesses; verify against REAL captured executions, then replace `n8n/fixtures/*.json`.\n2. **Send nodes are stubs** \u2014 `Call close-gateway (STUB)` intentionally does nothing. NOT IMPLEMENTED until send permission is granted.\n3. **Postgres credential + `setter_decisions` table** \u2014 wire on import.\n4. **Alerting** on the Unknown-shape error sink \u2014 wire later.",
+        "height": 560,
+        "width": 480,
+        "color": 4
+      },
+      "id": "91961006-86f5-410f-a1c6-9468e6a485c1",
+      "name": "Sticky Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        80,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "tt-inbound-crm",
+        "options": {}
+      },
+      "id": "e9724af0-4151-4f29-898e-6f348ae0128b",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        340,
+        420
+      ],
+      "notes": "Single intake. GHL workflow webhooks (\"Customer Replied\") and Close webhooks POST here."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// ============================================================================\n// WF-01 -- Normalize\n// Maps inbound webhook payloads (GHL workflow webhooks and Close webhooks)\n// into the canonical message consumed by the agent service:\n//\n//   {\n//     message_id: string,            // stable id of the inbound message\n//     channel:    \"sms\" | \"email\",   // Phase 1 = sms; email is Phase 2\n//     source:     \"close\" | \"ghl\",   // which system delivered the event\n//     sender:     string,            // phone number (sms) or email address\n//     body:       string,            // message text\n//     timestamp:  string             // ISO-8601 of when the message arrived\n//   }\n//\n// SHAPE STATUS: UNVERIFIED. No real captured executions have been seen yet.\n// Every field marked [VERIFY] below is a best guess and MUST be checked\n// against a real GHL workflow webhook execution and a real Close webhook\n// execution before this workflow goes live. Illustrative shapes live in\n// n8n/fixtures/ (GHL: ghl_customer_replied.json, Close: close_sms.json).\n//\n// Contract:\n//   - Output 0 (main): one canonical message item per recognised payload.\n//   - Output 1 (error): payloads this node could not recognise, routed to\n//     the error sink for logging. NEVER throws -- unknown shapes land on\n//     output 1, never crash the workflow.\n// ============================================================================\n\nconst items = $input.all();\nconst ok = [];   // output 0: canonical messages\nconst bad = [];  // output 1: unknown shapes\n\n// ---- Shape detectors -------------------------------------------------------\nfunction isCloseWebhook(p) {\n  // Close webhooks wrap the payload as { event, object_type, data, ... }. [VERIFY]\n  if (!p || typeof p !== 'object') return false;\n  return (typeof p.event === 'string' && p.data && typeof p.data === 'object')\n      || typeof p.object_type === 'string';\n}\n\nfunction isGHLWorkflowWebhook(p) {\n  // GHL workflow webhooks (e.g. the \"Customer Replied\" workflow) POST the\n  // contact object plus message/trigger fields. [VERIFY]\n  if (!p || typeof p !== 'object') return false;\n  return (p.contact && typeof p.contact === 'object')\n      || typeof p.contact_id === 'string'\n      || (p.message && typeof p.message === 'object');\n}\n\n// ---- Mappers ----------------------------------------------------------------\nfunction mapGHL(p) {\n  const contact = p.contact || {};                 // [VERIFY] contact object present?\n  const msg = p.message || {};                     // [VERIFY] message object present?\n  const rawType = String(msg.type || msg.channel || p.channel || '').toUpperCase(); // [VERIFY]\n  const channel = rawType === 'EMAIL' ? 'email' : 'sms'; // default sms; Phase 1 scope. [VERIFY]\n  return {\n    message_id: String(msg.id || p.message_id || p.event_id || ''), // [VERIFY]\n    channel,\n    source: 'ghl',\n    // Prefer the channel-appropriate identity. [VERIFY]\n    sender: channel === 'email'\n      ? String(contact.email || msg.from || '')\n      : String(contact.phone || contact.phone_number || msg.from || ''),\n    body: String(msg.body || msg.text || ''),                       // [VERIFY]\n    timestamp: String(msg.date_added || msg.created_at || p.timestamp || new Date().toISOString()), // [VERIFY]\n  };\n}\n\nfunction mapClose(p) {\n  const data = p.data || {};                        // [VERIFY] payload wrapped in `data`?\n  const rawType = String(data.type || data.activity_type || '').toUpperCase(); // [VERIFY]\n  const channel = rawType === 'EMAIL' ? 'email' : 'sms'; // [VERIFY]\n  const contact = data.contact || {};               // [VERIFY] contact nested under data?\n  const phones = Array.isArray(contact.phones) ? contact.phones : []; // [VERIFY]\n  const firstPhone = (phones[0] && phones[0].phone) || '';\n  return {\n    message_id: String(data.id || p.id || ''),      // [VERIFY]\n    channel,\n    source: 'close',\n    sender: channel === 'email'\n      ? String(contact.email || data.sender || '')  // [VERIFY]\n      : String(firstPhone || contact.phone || data.sender || ''), // [VERIFY]\n    body: String(data.text || data.body || ''),     // [VERIFY]\n    timestamp: String(data.date_created || data.created_at || p.date_created || new Date().toISOString()), // [VERIFY]\n  };\n}\n\n// ---- Main -------------------------------------------------------------------\nfor (const item of items) {\n  const p = item.json;\n  let canonical = null;\n  let shape = 'unknown';\n\n  if (isCloseWebhook(p)) { shape = 'close'; canonical = mapClose(p); }\n  else if (isGHLWorkflowWebhook(p)) { shape = 'ghl'; canonical = mapGHL(p); }\n\n  if (canonical && canonical.body && canonical.sender) {\n    ok.push({ json: canonical });\n  } else {\n    bad.push({ json: {\n      error: 'unknown_or_incomplete_shape',\n      detected_shape: shape,\n      hint: 'Compare against n8n/fixtures/*.json and update the mappers above.',\n      raw: p,\n    }});\n  }\n}\n\n// Two outputs: [canonical messages, unknown shapes]. Never throws.\nreturn [ok, bad];\n"
+      },
+      "id": "bd9a2344-0595-45cb-ad44-27af962500cc",
+      "name": "Normalize",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        560,
+        420
+      ],
+      "notes": "Detects GHL-workflow vs Close shape; maps to the canonical message. Output 0 = canonical messages. Output 1 (error) = unknown shapes \u2192 error sink. Field mapping is UNVERIFIED \u2014 see code comments and fixtures."
+    },
+    {
+      "parameters": {},
+      "id": "2051e41f-3a58-4dc3-b773-7138f1da1efc",
+      "name": "Unknown payload shape",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        560,
+        660
+      ],
+      "notes": "Error sink for unrecognised webhook payloads (Normalize output 1). Feeds Log so the raw payload is preserved for later mapping. Wire alerting here later \u2014 nothing fails silently."
+    },
+    {
+      "parameters": {},
+      "id": "7c8e4532-d8e1-4a47-85f5-69181279515b",
+      "name": "Pre-pass note",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        780,
+        420
+      ],
+      "notes": "Pass-through only. Opt-out handling (STOP/HELP, compliance) and duplicate/idempotency handling live in the AGENT SERVICE deterministic pre-pass, not here. n8n stays thin."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.AGENT_SERVICE_URL }}/classify",
+        "authentication": "none",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "timeout": 60000,
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        }
+      },
+      "id": "afe944e9-c693-4016-85f0-54965c69ae52",
+      "name": "Call agent service",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1000,
+        420
+      ],
+      "notes": "POSTs the canonical message to the agent service. URL from env var AGENT_SERVICE_URL \u2014 no hardcoded host. Expects back {\"intent\",\"confidence\",\"reasoning\",\"skill\",\"mode\"}."
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose"
+                },
+                "conditions": [
+                  {
+                    "id": "active-cond",
+                    "leftValue": "={{ $json.mode }}",
+                    "rightValue": "active",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.string.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "active"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose"
+                },
+                "conditions": [
+                  {
+                    "id": "shadow-cond",
+                    "leftValue": "={{ $json.mode }}",
+                    "rightValue": "shadow",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.string.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "shadow"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose"
+                },
+                "conditions": [
+                  {
+                    "id": "none-cond",
+                    "leftValue": "={{ $json.mode }}",
+                    "rightValue": "none",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.string.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "none"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra",
+          "renameAllOutputs": false
+        },
+        "looseTypeValidation": true
+      },
+      "id": "d7e57fd6-648e-4ae4-837e-998200d7d335",
+      "name": "Dispatch",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        1220,
+        420
+      ],
+      "notes": "Single routing decision on the agent's returned `mode`: active \u2192 send stub, shadow \u2192 log only, none \u2192 end. Unexpected modes fall through to the extra output \u2192 Log (never silently dropped)."
+    },
+    {
+      "parameters": {},
+      "id": "d84f7676-f553-4939-aa7d-cdaee096be37",
+      "name": "Call close-gateway (STUB)",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1440,
+        260
+      ],
+      "notes": "STUB \u2014 NOT IMPLEMENTED. When send permission is granted, this becomes the call to close-gateway.send_sms (allowlist enforced inside the gateway). Until then this node intentionally does nothing. Nothing sends from this workflow."
+    },
+    {
+      "parameters": {},
+      "id": "bbf2bef3-ed29-4364-a316-432f2558e05d",
+      "name": "End (no action)",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1440,
+        580
+      ],
+      "notes": "mode=none: the agent decided no action. Workflow ends here."
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "table": {
+          "mode": "list",
+          "value": "setter_decisions",
+          "cachedResultName": "setter_decisions"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "message_id": "={{ $('Normalize').item.json.message_id }}",
+            "channel": "={{ $('Normalize').item.json.channel }}",
+            "source": "={{ $('Normalize').item.json.source }}",
+            "sender": "={{ $('Normalize').item.json.sender }}",
+            "body": "={{ $('Normalize').item.json.body }}",
+            "timestamp": "={{ $('Normalize').item.json.timestamp }}",
+            "intent": "={{ $json.intent }}",
+            "confidence": "={{ $json.confidence }}",
+            "reasoning": "={{ $json.reasoning }}",
+            "skill": "={{ $json.skill }}",
+            "mode": "={{ $json.mode }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "message_id",
+              "displayName": "message_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "channel",
+              "displayName": "channel",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "source",
+              "displayName": "source",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "sender",
+              "displayName": "sender",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "body",
+              "displayName": "body",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "timestamp",
+              "displayName": "timestamp",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "intent",
+              "displayName": "intent",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "confidence",
+              "displayName": "confidence",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "reasoning",
+              "displayName": "reasoning",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "skill",
+              "displayName": "skill",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "mode",
+              "displayName": "mode",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "85530d22-ebcc-4be3-a9d6-6fad94d67f9c",
+      "name": "Log",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        1660,
+        420
+      ],
+      "notes": "Decision record: canonical message + agent decision \u2192 `setter_decisions` table. Message fields are read back from the Normalize node via $('Normalize') expressions. WIRE ON IMPORT: Postgres credential (named, not embedded) + table. What makes accuracy measurable.",
+      "credentials": {
+        "postgres": {
+          "id": null,
+          "name": "Setter Postgres (wire on import)"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Normalize",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize": {
+      "main": [
+        [
+          {
+            "node": "Pre-pass note",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Unknown payload shape",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Unknown payload shape": {
+      "main": [
+        [
+          {
+            "node": "Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pre-pass note": {
+      "main": [
+        [
+          {
+            "node": "Call agent service",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call agent service": {
+      "main": [
+        [
+          {
+            "node": "Dispatch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dispatch": {
+      "main": [
+        [
+          {
+            "node": "Call close-gateway (STUB)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "End (no action)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call close-gateway (STUB)": {
+      "main": [
+        [
+          {
+            "node": "Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "pinData": {}
+}

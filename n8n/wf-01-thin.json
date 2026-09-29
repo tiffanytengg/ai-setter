@@ -1,0 +1,365 @@
+{
+  "name": "WF-01 Pipeline (thin)",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## WF-01 \u2014 thin orchestration (Track B)\nWebhook `tt-inbound-crm` \u2192 Normalize \u2192 Pre-pass note \u2192 Call agent service \u2192 Dispatch \u2192 Log\n\n- **No reasoning in n8n.** The agent service decides; this workflow only routes.\n- **Required env vars (n8n environment):** `AGENT_SERVICE_URL` (e.g. http://agent-service:8000), `AGENT_SHARED_SECRET` (sent as the `X-Agent-Token` header).\n- Canonical message: `{message_id, channel, source, sender, body, timestamp}` (see README).\n\n### Stubbed / pending\n1. **Payload mapping unverified** \u2014 GHL + Close field names are best guesses; verify against REAL captured executions, then replace `n8n/fixtures/*.json`.\n2. **Send nodes are stubs** \u2014 `Call ghl-gateway (STUB)` intentionally does nothing. NOT IMPLEMENTED until send permission is granted. Close is read-only by design; the live send path is ghl-gateway.send_sms, not Close. Nothing sends from this workflow.\n3. **Postgres credential + `messages` table** \u2014 wire on import. Happy-path decision logging is owned by the agent service (`messages` + `decisions`); the Log node is the anomaly sink only (unknown payload shapes).\n4. **Alerting** on the Unknown-shape error sink \u2014 wire later.",
+        "height": 560,
+        "width": 480,
+        "color": 4
+      },
+      "id": "91961006-86f5-410f-a1c6-9468e6a485c1",
+      "name": "Sticky Note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        80,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "tt-inbound-crm",
+        "options": {}
+      },
+      "id": "e9724af0-4151-4f29-898e-6f348ae0128b",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        340,
+        420
+      ],
+      "notes": "Single intake. GHL workflow webhooks (\"Customer Replied\") and Close webhooks POST here."
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// ============================================================================\n// WF-01 -- Normalize\n// Maps inbound webhook payloads (GHL workflow webhooks and Close webhooks)\n// into the canonical message consumed by the agent service:\n//\n//   {\n//     message_id: string,            // stable id of the inbound message\n//     channel:    \"sms\" | \"email\",   // Phase 1 = sms; email is Phase 2\n//     source:     \"close\" | \"ghl\",   // which system delivered the event\n//     contact_id: string,            // GHL contact id (ghl only; \"\" if unknown)\n//     sender:     string,            // phone number (sms) or email address\n//     body:       string,            // message text\n//     timestamp:  string             // ISO-8601 of when the message arrived\n//   }\n//\n// SHAPE STATUS: DEFENSIVE, STILL UNVERIFIED. GHL's workflow Webhook action\n// POSTs whatever custom data was configured on the action -- ours has none\n// configured yet, so the real default body shape is UNKNOWN until the first\n// real execution lands. Every path marked [VERIFY] is therefore tried as a\n// *candidate*: the mapper takes the first non-empty value across all plausible\n// paths, and the main gate below REFUSES to emit a canonical message unless\n// a body AND an identity (sender phone/email or GHL contact_id) were actually\n// found. Unknown/incomplete shapes route to output 1 (the anomaly sink) --\n// \"doing nothing is the default\" applies to parsing too. When the first real\n// execution arrives, tighten the mappers to its exact paths and re-verify.\n//\n// Contract:\n//   - Output 0 (main): one canonical message item per recognised payload.\n//   - Output 1 (error): payloads this node could not recognise, routed to\n//     the error sink for logging. NEVER throws -- unknown shapes land on\n//     output 1, never crash the workflow.\n// ============================================================================\n\nconst items = $input.all();\nconst ok = [];   // output 0: canonical messages\nconst bad = [];  // output 1: unknown shapes\n\n// First non-empty string wins. Present-but-blank values are skipped so an\n// empty key never shadows a populated one further down the candidate list.\nfunction pick(...vals) {\n  for (const v of vals) {\n    if (v === null || v === undefined) continue;\n    const s = String(v).trim();\n    if (s) return s;\n  }\n  return '';\n}\n\n// ---- Shape detectors -------------------------------------------------------\nfunction isCloseWebhook(p) {\n  // Close webhooks wrap the payload as { event, object_type, data, ... }. [VERIFY]\n  if (!p || typeof p !== 'object') return false;\n  return (typeof p.event === 'string' && p.data && typeof p.data === 'object')\n      || typeof p.object_type === 'string';\n}\n\nfunction isGHLWorkflowWebhook(p) {\n  // GHL workflow webhooks (e.g. the \"Customer Replied\" workflow) POST the\n  // contact object plus message/trigger fields -- exact keys [VERIFY].\n  if (!p || typeof p !== 'object') return false;\n  return (p.contact && typeof p.contact === 'object')\n      || typeof p.contact_id === 'string'\n      || typeof p.contactId === 'string'\n      || (p.message && typeof p.message === 'object')\n      || (p.eventData && p.eventData.source === 'workflow');\n}\n\n// ---- Mappers ----------------------------------------------------------------\nfunction mapGHL(p) {\n  const contact = (p.contact && typeof p.contact === 'object') ? p.contact : {};\n  const msg = (p.message && typeof p.message === 'object') ? p.message : {};\n  const rawType = pick(msg.type, msg.channel, msg.reply_channel,\n                       p.channel, p.reply_channel, p.type);            // [VERIFY]\n  const channel = /email/i.test(rawType) ? 'email' : 'sms'; // default sms; Phase 1 scope. [VERIFY]\n  return {\n    message_id: pick(msg.id, p.message_id, p.messageId, p.event_id, p.eventId, p.id), // [VERIFY]\n    channel,\n    source: 'ghl',\n    contact_id: pick(contact.id, p.contact_id, p.contactId), // [VERIFY] feeds ghl.send_sms\n    sender: pick(contact.phone, contact.phone_number, p.phone, p.phone_number,\n                 msg.from, msg.phone),                       // [VERIFY]\n    body: pick(msg.body, msg.text, msg.message, p.body, p.text,\n               p.message_body, p.messageText),                // [VERIFY]\n    timestamp: pick(msg.date_added, msg.created_at, msg.createdAt, msg.date_created,\n                    p.timestamp, p.date_created, p.createdAt,\n                    new Date().toISOString()),                // [VERIFY]\n  };\n}\n\nfunction mapClose(p) {\n  const data = p.data || {};                        // [VERIFY] payload wrapped in `data`?\n  const rawType = String(data.type || data.activity_type || '').toUpperCase(); // [VERIFY]\n  const channel = rawType === 'EMAIL' ? 'email' : 'sms'; // [VERIFY]\n  const contact = data.contact || {};               // [VERIFY] contact nested under data?\n  const phones = Array.isArray(contact.phones) ? contact.phones : []; // [VERIFY]\n  const firstPhone = (phones[0] && phones[0].phone) || '';\n  return {\n    message_id: String(data.id || p.id || ''),      // [VERIFY]\n    channel,\n    source: 'close',\n    sender: channel === 'email'\n      ? String(contact.email || data.sender || '')  // [VERIFY]\n      : String(firstPhone || contact.phone || data.sender || ''), // [VERIFY]\n    body: String(data.text || data.body || ''),     // [VERIFY]\n    timestamp: String(data.date_created || data.created_at || p.date_created || new Date().toISOString()), // [VERIFY]\n  };\n}\n\n// ---- Main -------------------------------------------------------------------\nfor (const item of items) {\n  const p = item.json;\n  let canonical = null;\n  let shape = 'unknown';\n\n  if (isCloseWebhook(p)) { shape = 'close'; canonical = mapClose(p); }\n  else if (isGHLWorkflowWebhook(p)) { shape = 'ghl'; canonical = mapGHL(p); }\n\n  const missing = [];\n  if (!canonical) {\n    missing.push('unrecognized_shape');\n  } else {\n    if (!canonical.body) missing.push('body');\n    if (!canonical.sender && !canonical.contact_id) missing.push('sender/contact_id');\n  }\n\n  if (canonical && missing.length === 0) {\n    ok.push({ json: canonical });\n  } else {\n    bad.push({ json: {\n      error: 'unknown_or_incomplete_shape',\n      detected_shape: shape,\n      missing,\n      hint: 'Compare against n8n/fixtures/*.json and update the mappers above.',\n      raw: p,\n    }});\n  }\n}\n\n// Two outputs: [canonical messages, unknown shapes]. Never throws.\nreturn [ok, bad];\n"
+      },
+      "id": "bd9a2344-0595-45cb-ad44-27af962500cc",
+      "name": "Normalize",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        560,
+        420
+      ],
+      "notes": "Detects GHL-workflow vs Close shape; maps to the canonical message. Output 0 = canonical messages. Output 1 (error) = unknown shapes \u2192 error sink. Field mapping is UNVERIFIED \u2014 see code comments and fixtures."
+    },
+    {
+      "parameters": {},
+      "id": "2051e41f-3a58-4dc3-b773-7138f1da1efc",
+      "name": "Unknown payload shape",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        560,
+        660
+      ],
+      "notes": "Error sink for unrecognised webhook payloads (Normalize output 1). Feeds Log so the raw payload is preserved for later mapping. Wire alerting here later \u2014 nothing fails silently."
+    },
+    {
+      "parameters": {},
+      "id": "7c8e4532-d8e1-4a47-85f5-69181279515b",
+      "name": "Pre-pass note",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        780,
+        420
+      ],
+      "notes": "Pass-through only. Opt-out handling (STOP/HELP, compliance) and duplicate/idempotency handling live in the AGENT SERVICE deterministic pre-pass, not here. n8n stays thin."
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $env.AGENT_SERVICE_URL }}/webhook/message",
+        "authentication": "none",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "timeout": 60000,
+          "response": {
+            "response": {
+              "responseFormat": "json"
+            }
+          }
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "X-Agent-Token",
+              "value": "={{ $env.AGENT_SHARED_SECRET }}"
+            }
+          ]
+        }
+      },
+      "id": "afe944e9-c693-4016-85f0-54965c69ae52",
+      "name": "Call agent service",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1000,
+        420
+      ],
+      "notes": "POSTs the canonical message to the agent service (/webhook/message). URL from env AGENT_SERVICE_URL; auth via X-Agent-Token header from env AGENT_SHARED_SECRET. Expects back {\"message_id\",\"intent\",\"confidence\",\"reasoning\",\"skill\",\"mode\",\"action_plan\",\"would_send\",\"send_tool\"}."
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose"
+                },
+                "conditions": [
+                  {
+                    "id": "active-cond",
+                    "leftValue": "={{ $json.mode }}",
+                    "rightValue": "active",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.string.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "active"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose"
+                },
+                "conditions": [
+                  {
+                    "id": "shadow-cond",
+                    "leftValue": "={{ $json.mode }}",
+                    "rightValue": "shadow",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.string.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "shadow"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose"
+                },
+                "conditions": [
+                  {
+                    "id": "none-cond",
+                    "leftValue": "={{ $json.mode }}",
+                    "rightValue": "none",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals",
+                      "name": "filter.operator.string.equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "none"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra",
+          "renameAllOutputs": false
+        },
+        "looseTypeValidation": true
+      },
+      "id": "d7e57fd6-648e-4ae4-837e-998200d7d335",
+      "name": "Dispatch",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        1220,
+        420
+      ],
+      "notes": "Single routing decision on the agent's returned `mode`: active \u2192 send stub, shadow \u2192 log only, none \u2192 end. Unexpected modes fall through to the extra output \u2192 Log (never silently dropped)."
+    },
+    {
+      "parameters": {},
+      "id": "d84f7676-f553-4939-aa7d-cdaee096be37",
+      "name": "Call ghl-gateway (STUB)",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1440,
+        260
+      ],
+      "notes": "STUB \u2014 NOT IMPLEMENTED. When send permission is granted, this becomes the call to ghl-gateway.send_sms (allowlist enforced inside the gateway). Until then this node intentionally does nothing. Nothing sends from this workflow. Close is read-only by design \u2014 the live send path is GHL, not Close."
+    },
+    {
+      "parameters": {},
+      "id": "bbf2bef3-ed29-4364-a316-432f2558e05d",
+      "name": "End (no action)",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        1440,
+        580
+      ],
+      "notes": "mode=none: the agent decided no action. Workflow ends here."
+    },
+    {
+      "parameters": {
+        "operation": "insert",
+        "table": {
+          "mode": "list",
+          "value": "messages",
+          "cachedResultName": "messages"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "id": "={{ 'unknown-' + Date.now() + '-' + Math.floor(Math.random()*1000000) }}",
+            "message_id": "={{ $json.raw.message_id || $json.raw.messageId || 'unknown-' + Date.now() }}",
+            "channel": "={{ $json.raw.channel || 'unknown' }}",
+            "source": "={{ $json.raw.source || 'unknown' }}",
+            "sender": "={{ $json.raw.sender || $json.raw.from || 'unknown' }}",
+            "body": "={{ JSON.stringify($json.raw) }}",
+            "received_at": "={{ $json.raw.timestamp || $now.toISO() }}"
+          },
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": {}
+      },
+      "id": "85530d22-ebcc-4be3-a9d6-6fad94d67f9c",
+      "name": "Log",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.4,
+      "position": [
+        1660,
+        420
+      ],
+      "notes": "Anomaly sink: unknown payload shapes -> `messages` table with a synthetic message_id (raw payload preserved in `body`). Happy-path decision logging is owned by the agent service (`messages` + `decisions` via setter-memory), so this node is NOT wired to the Dispatch outputs. WIRE ON IMPORT: Postgres credential",
+      "credentials": {
+        "postgres": {
+          "id": null,
+          "name": "Setter Postgres (wire on import)"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Normalize",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalize": {
+      "main": [
+        [
+          {
+            "node": "Pre-pass note",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Unknown payload shape",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Unknown payload shape": {
+      "main": [
+        [
+          {
+            "node": "Log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Pre-pass note": {
+      "main": [
+        [
+          {
+            "node": "Call agent service",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Call agent service": {
+      "main": [
+        [
+          {
+            "node": "Dispatch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dispatch": {
+      "main": [
+        [
+          {
+            "node": "Call ghl-gateway (STUB)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [],
+        [
+          {
+            "node": "End (no action)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Call ghl-gateway (STUB)": {
+      "main": [
+        []
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "pinData": {}
+}

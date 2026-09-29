@@ -1,0 +1,22 @@
+[project]
+name = "setter-memory"
+version = "0.1.0"
+requires-python = ">=3.11"
+description = "Stdio MCP server: audit-trail storage (messages + decisions) over Postgres."
+
+dependencies = [
+    # mcp 2.x renamed FastMCP -> MCPServer; we pin <2 until migrated.
+    "mcp>=1.0,<2",
+    "psycopg[binary]>=3.1",
+    "pydantic>=2.0",
+]
+
+[project.scripts]
+setter-memory-server = "setter_memory.server:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
