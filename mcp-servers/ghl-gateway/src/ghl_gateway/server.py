@@ -230,7 +230,7 @@ def main() -> None:
     if transport in ("sse", "streamable-http"):
         # Remote deployments (Railway): serve MCP over HTTP. Railway injects
         # PORT; MCP_PORT overrides it when set explicitly.
-        mcp.settings.host = os.environ.get("MCP_HOST", "0.0.0.0")
+        mcp.settings.host = os.environ.get("MCP_HOST", "::")
         mcp.settings.port = int(os.environ.get("MCP_PORT", os.environ.get("PORT", "8000")))
     mcp.run(transport=transport)
 
