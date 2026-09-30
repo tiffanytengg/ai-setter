@@ -25,6 +25,7 @@ import json
 import os
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 CLOSE_BASE = "https://api.close.com/api/v1"
 
@@ -240,6 +241,27 @@ def render_template(template: str, lead_id: str, booking_link: str = "") -> str:
     return TEMPLATES[template].format(name=name, link=link, sender_name=sender_name)
 
 
+def _transport_security() -> TransportSecuritySettings:
+    """DNS rebinding protection with the real served hostnames allowed.
+
+    FastMCP auto-enables DNS rebinding protection for localhost-only when
+    constructed with its default host; merely overriding mcp.settings.host
+    afterwards does not update the allow-list, so remote callers (e.g. the
+    agent over Railway private networking) get 421 "Invalid Host header".
+    Rebuild the allow-list explicitly: local dev hosts plus MCP_ALLOWED_HOSTS
+    (comma-separated, e.g. "close-gateway.railway.internal:*").
+    """
+    raw = os.environ.get("MCP_ALLOWED_HOSTS", "")
+    allowed = [h.strip() for h in raw.split(",") if h.strip()]
+    for default in ("127.0.0.1:*", "localhost:*", "[::1]:*"):
+        if default not in allowed:
+            allowed.append(default)
+    return TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=allowed,
+    )
+
+
 def main() -> None:
     transport = os.environ.get("MCP_TRANSPORT", "stdio").lower()
     if transport in ("sse", "streamable-http"):
@@ -247,6 +269,8 @@ def main() -> None:
         # PORT; MCP_PORT overrides it when set explicitly.
         mcp.settings.host = os.environ.get("MCP_HOST", "::")
         mcp.settings.port = int(os.environ.get("MCP_PORT", os.environ.get("PORT", "8000")))
+        # See _transport_security: without this, non-localhost callers get 421.
+        mcp.settings.transport_security = _transport_security()
     mcp.run(transport=transport)
 
 
