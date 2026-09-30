@@ -85,14 +85,30 @@ class GatewayClient:
                 async with ClientSession(read, write) as session:
                     await session.initialize()
                     result = await session.call_tool(tool, arguments)
-        except GatewayError:
-            raise
-        except Exception as exc:  # noqa: BLE001 — normalize to GatewayError
-            raise GatewayError(
-                f"{self.name}: call {tool} failed "
-                f"({type(exc).__name__}: {exc})"
-            ) from exc
-        return _unwrap(result)
+    except GatewayError:
+        raise
+    except Exception as exc:  # noqa: BLE001 — normalize to GatewayError
+        raise GatewayError(
+            f"{self.name} ({self.url}): call {tool} failed "
+            f"({_format_exception(exc)})"
+    ) from exc
+    return _unwrap(result)
+
+    def _format_exception(exc: BaseException) -> str:
+    """Flatten an exception (unwrapping ExceptionGroups) into one line."""
+    parts: list[str] = []
+    seen: set[int] = set()
+
+    def walk(e: BaseException, depth: int = 0) -> None:
+        if id(e) in seen or depth > 3:
+            return
+        seen.add(id(e))
+        parts.append(f"{type(e).__name__}: {e}".strip()[:400])
+        for sub in getattr(e, "exceptions", None) or []:
+            walk(sub, depth + 1)
+
+    walk(exc)
+    return " | ".join(parts)
 
 
 def call_tool_sync(client: GatewayClient, tool: str, arguments: dict):
