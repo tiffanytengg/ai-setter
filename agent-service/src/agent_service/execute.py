@@ -44,7 +44,8 @@ def render_send_preview(planned: dict, message: dict) -> dict:
             "recipient": _recipient_for(message),
             "template": _template_for((planned or {}).get("skill")),
             "render_tool": "close.render_template",
-            "send_tool": (planned or {}).get("send_tool_before_shadow") or "ghl.send_sms",
+            "send_tool": (planned or {}).get("send_tool_before_shadow")
+            or (planned or {}).get("send_tool"),
             "body": body,
         }
 
@@ -109,6 +110,13 @@ def execute_plan(planned: dict, message: dict) -> dict:
                     "booking link unresolvable — escalated, never invent a link")
 
     # 2. Send (gated inside the gateway).
+    # Only the GHL pathway can execute; the Close pathway is shadow-only
+    # by design (Close is read-only).
+    if planned.get("send_tool") != "ghl.send_sms":
+        return _out(True, False,
+                    f"send refused: {planned.get('send_tool')} is not an "
+                    "executable send pathway")
+
     try:
         send_result = call_tool_sync(
             ghl_gateway, "send_sms",

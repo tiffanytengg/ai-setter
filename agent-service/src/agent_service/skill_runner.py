@@ -24,7 +24,20 @@ import os
 
 CONFIDENCE_THRESHOLD = 0.7
 
-ACTIVE_SEND_TOOL = "ghl.send_sms"
+# Source-matched send pathways. A Close inbound's plan must never name the
+# GHL send tool and vice versa — the two systems never overlap in POST/SEND.
+# Close is read-only, so its pathway is shadow-only by construction: it can be
+# planned and logged, never executed.
+_SEND_TOOL_BY_SOURCE = {
+    "close": "close.send_sms",  # shadow-only; no live execution path exists
+    "ghl": "ghl.send_sms",      # gated live send (master switch + allowlist)
+}
+
+
+def _send_tool_for(source):
+    # Unknown source fails closed onto the shadow-only Close pathway.
+    return _SEND_TOOL_BY_SOURCE.get(source, "close.send_sms")
+
 
 # intent -> (skill file slug, mode). Active skills may send; shadow skills
 # only log + escalate. Anything else maps to no skill.
@@ -52,7 +65,7 @@ def plan(classification, message):
     Returns:
         {"skill": str|None, "mode": "active"|"shadow"|"none",
          "action_plan": [steps...], "would_send": bool,
-         "send_tool": "ghl.send_sms"|None, "escalation_note": str|None}
+         "send_tool": str|None, "escalation_note": str|None}
     """
     intent = (classification or {}).get("intent")
     confidence = (classification or {}).get("confidence")
@@ -125,6 +138,7 @@ def plan(classification, message):
         }
 
     template = _template_for(skill)
+    send_tool = _send_tool_for((message or {}).get("source"))
     planned = {
         "skill": skill,
         "mode": "active",
@@ -135,12 +149,17 @@ def plan(classification, message):
             "[{}] Planned: render_template(template={!r}, lead_id=<lead>, "
             "booking_link=<resolved>).".format(DRY_RUN_MARKER, template),
             "[{}] Planned: send_sms(lead_id=<lead>, body=<rendered>) via "
-            "{} — allowlist enforced inside the gateway.".format(DRY_RUN_MARKER, ACTIVE_SEND_TOOL),
+            "{} ({}).".format(
+                DRY_RUN_MARKER,
+                send_tool,
+                "allowlist enforced inside the gateway"
+                if send_tool == "ghl.send_sms"
+                else "shadow-only pathway — Close is read-only, never executes"),
             "[{}] Log outcome via memory.log_decision (intent, confidence, "
             "reasoning, message_id, rendered body).".format(DRY_RUN_MARKER),
         ],
         "would_send": True,
-        "send_tool": ACTIVE_SEND_TOOL,
+        "send_tool": send_tool,
         "escalation_note": None,
     }
 
@@ -149,7 +168,7 @@ def plan(classification, message):
     if os.environ.get("AGENT_FORCE_SHADOW") == "true":
         planned["shadowed_from_active"] = True
         planned["would_send_before_shadow"] = True
-        planned["send_tool_before_shadow"] = ACTIVE_SEND_TOOL
+        planned["send_tool_before_shadow"] = send_tool
         planned["mode_before_shadow"] = "active"
         planned["mode"] = "shadow"
         planned["would_send"] = False

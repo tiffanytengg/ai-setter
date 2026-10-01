@@ -44,4 +44,4 @@ tests/
 3. All credentials come from environment variables. Never write a secret to any file.
 4. Missing credentials → honest `"not configured"` errors. Never synthesize data.
 5. Keep n8n thin: webhook → normalize → call agent → dispatch → log. No reasoning, no business rules in n8n.
-6. Track A is frozen. The single allowed edit: in `skill_runner.py`, change the `ACTIVE_SEND_TOOL` string from `"close.send_sms"` to `"ghl.send_sms"` (label only; it does not affect classification).
+6. Track A is frozen. Send tools are source-matched in `skill_runner.py`: Close plans use the shadow-only `close.send_sms` label, while GHL plans use the gated `ghl.send_sms` path.

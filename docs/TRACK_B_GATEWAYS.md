@@ -170,10 +170,9 @@ cd mcp-servers/ghl-gateway && pip install -e . && \
    Click the booking link.
 6. Run the full loop repeatedly before the Sept 30 demo.
 
-**One-line change needed on your local Track A copy:** in
-`agent-service/src/agent_service/skill_runner.py`,
-`ACTIVE_SEND_TOOL = "close.send_sms"` → `"ghl.send_sms"`.
-(The workspace copy is already updated; yours still has the old string.)
+**Current Track A send labels:** `agent-service/src/agent_service/skill_runner.py`
+source-matches send tools: Close plans use the shadow-only `close.send_sms`
+label, while GHL plans use the gated `ghl.send_sms` path.
 
 ## 9. Deliberately NOT tonight
 
