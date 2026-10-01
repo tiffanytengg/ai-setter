@@ -20,6 +20,8 @@ See skills/*.md for the authoritative per-skill behavior docs.
 
 from __future__ import annotations
 
+import os
+
 CONFIDENCE_THRESHOLD = 0.7
 
 ACTIVE_SEND_TOOL = "ghl.send_sms"
@@ -123,7 +125,7 @@ def plan(classification, message):
         }
 
     template = _template_for(skill)
-    return {
+    planned = {
         "skill": skill,
         "mode": "active",
         "action_plan": [
@@ -141,3 +143,15 @@ def plan(classification, message):
         "send_tool": ACTIVE_SEND_TOOL,
         "escalation_note": None,
     }
+
+    # Forced shadow (demo/rehearsal): keep the full action plan as built, but
+    # downgrade so execute_plan() never touches the gateways.
+    if os.environ.get("AGENT_FORCE_SHADOW") == "true":
+        planned["mode"] = "shadow"
+        planned["would_send"] = False
+        planned["send_tool"] = None
+        planned["escalation_note"] = (
+            "forced shadow via AGENT_FORCE_SHADOW — full plan built and logged, "
+            "never executed"
+        )
+    return planned

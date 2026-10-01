@@ -22,3 +22,6 @@ node_modules/
 
 # n8n
 *.n8n-credentials.json
+
+# Replay outputs (contain real phone numbers)
+scripts/output/
