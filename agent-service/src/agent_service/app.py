@@ -85,24 +85,28 @@ def _require_auth(request: Request) -> None:
 # ---------------------------------------------------------------------------
 
 def _default_llm_fn():
-    """Return an llm_fn(prompt)->str when explicitly enabled, else None.
+    """Return an llm_fn(prompt)->str unless explicitly disabled.
 
-    Enabled only when AGENT_USE_LLM=true AND ANTHROPIC_API_KEY is set.
-    Default: None -> the offline keyword baseline (eval/testing).
+    The LLM path is the service default. Set AGENT_USE_LLM=false for the
+    offline keyword baseline. Missing/invalid keys and network failures are
+    handled per message by classifier.classify(), which falls back to the
+    keyword baseline instead of raising.
     """
-    if os.environ.get("AGENT_USE_LLM") != "true":
+    if os.environ.get("AGENT_USE_LLM", "true").strip().lower() == "false":
         return None
     api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        log.warning("AGENT_USE_LLM=true but ANTHROPIC_API_KEY is not set; "
-                    "falling back to the keyword baseline")
-        return None
     model = os.environ.get("AGENT_LLM_MODEL", "claude-haiku-4-5")
+    try:
+        timeout = float(os.environ.get("ANTHROPIC_TIMEOUT_SECONDS", "10"))
+    except ValueError:
+        timeout = 10.0
 
     def _call(prompt: str) -> str:
+        if not api_key:
+            raise RuntimeError("ANTHROPIC_API_KEY is not set")
         import anthropic  # deferred: only needed on the LLM path
 
-        client = anthropic.Anthropic(api_key=api_key)
+        client = anthropic.Anthropic(api_key=api_key, timeout=timeout)
         resp = client.messages.create(
             model=model, max_tokens=300,
             messages=[{"role": "user", "content": prompt}],

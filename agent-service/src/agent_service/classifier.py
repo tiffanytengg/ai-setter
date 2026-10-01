@@ -68,7 +68,10 @@ intent, 0.6 when it is ambiguous between two, 0.3 when it matches none
 """
 
 import json
+import logging
 import re
+
+log = logging.getLogger("agent_service.classifier")
 
 INTENTS = (
     "scheduling",
@@ -139,7 +142,7 @@ def _strip_fences(raw: str) -> str:
 
 
 def _llm_classify(message: dict, llm_fn) -> dict:
-    """LLM path. Returns the contract dict; never raises on model output."""
+    """LLM path. Falls back to keyword baseline on any model failure."""
     prompt = CLASSIFY_PROMPT_TEMPLATE.format(
         channel=message.get("channel", "?"),
         source=message.get("source", "?"),
@@ -153,12 +156,13 @@ def _llm_classify(message: dict, llm_fn) -> dict:
         reasoning = str(data.get("reasoning", ""))
         if intent not in INTENTS:
             raise ValueError(f"intent {intent!r} not in taxonomy")
-    except Exception as exc:  # noqa: BLE001 — any model-output problem falls back
-        snippet = str(raw if "raw" in dir() else "")[:200]
+    except Exception as exc:  # noqa: BLE001 — fallback must catch every LLM failure
+        fallback = _baseline_classify(message.get("body", ""))
+        error = f"{type(exc).__name__}: {exc}"[:200]
+        log.warning("LLM classifier failed; falling back to keyword baseline: %s", error)
         return {
-            "intent": "other",
-            "confidence": 0.0,
-            "reasoning": f"parse fallback: {type(exc).__name__}: {exc}; raw={snippet!r}",
+            **fallback,
+            "reasoning": f"llm fallback ({error}); {fallback['reasoning']}",
         }
     confidence = max(0.0, min(1.0, confidence))
     return {"intent": intent, "confidence": confidence, "reasoning": reasoning}
@@ -351,9 +355,10 @@ def classify(message: dict, llm_fn=None) -> dict:
     """Classify one canonical message.
 
     Returns {"intent": str, "confidence": float 0-1, "reasoning": str}.
-    With llm_fn: prompt -> model -> parsed JSON, never raises on model
-    output (parse problems return the "other"/0.0 fallback). Without
-    llm_fn: the keyword baseline (OFFLINE TESTING ONLY).
+    With llm_fn: prompt -> model -> parsed JSON, never raises. Any model,
+    network, credential, or parse failure falls back to the keyword baseline
+    for that message. Without llm_fn: the keyword baseline (OFFLINE TESTING
+    ONLY).
     """
     if llm_fn is not None:
         return _llm_classify(message, llm_fn)
