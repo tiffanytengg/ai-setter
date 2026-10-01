@@ -3,7 +3,7 @@
 
 Read-only. Uses CLOSE_API_KEY from mcp-servers/close-gateway/.env and never
 prints it. Searches outbound SMS for the booking template phrase, then emits
-the most recent inbound SMS before each matching outbound send.
+inbound SMS messages from the small context window around each matching send.
 """
 
 from __future__ import annotations
@@ -34,6 +34,13 @@ THREAD_WINDOW = 6
 PAGE_LIMIT = 100
 SLEEP_S = 0.15
 MAX_SCAN_PAGES = 75
+
+MANUAL_INTENT_OVERRIDES = {
+    "none of those times are acceptable": "rescheduling",
+    "i like wednesday at 2:00": "scheduling",
+    "i can't do this time": "rescheduling",
+    "not interested": "opt_out",
+}
 
 
 class CloseExportError(RuntimeError):
@@ -86,6 +93,85 @@ def sms_direction(sms: dict[str, Any]) -> str:
 
 def lead_phone(sms: dict[str, Any]) -> str:
     return sms.get("remote_phone") or sms.get("sender") or ""
+
+
+def suggest_intent(body: str) -> str:
+    """Lightweight labeling suggestion for mined candidates.
+
+    This is intentionally conservative and reviewable. It is not ground truth;
+    the human labeling pass can replace ``true_intent_suggestion`` with
+    ``true_intent`` for eval.
+    """
+    text = " ".join((body or "").lower().split())
+    if not text:
+        return "other"
+    if text in MANUAL_INTENT_OVERRIDES:
+        return MANUAL_INTENT_OVERRIDES[text]
+
+    opt_out = (
+        "stop texting", "stop messaging", "unsubscribe", "take me off",
+        "remove me", "not interested", "no longer interested",
+        "don't text", "do not text",
+    )
+    if text in {"stop", "unsubscribe", "quit", "end"} or any(p in text for p in opt_out):
+        return "opt_out"
+
+    refund = ("refund", "money back", "reimburs", "reverse the charge", "charged twice", "chargeback")
+    if any(p in text for p in refund):
+        return "refund"
+
+    # Appointment/call cancellation is rescheduling; program/subscription
+    # cancellation is cancellation.
+    reschedule = (
+        "reschedule", "re-schedule", "move my", "move the", "push back",
+        "change the time", "change my time", "can't do this time",
+        "cant do this time", "can't make", "cannot make", "won't be able to talk",
+        "will not be able to talk", "none of those times", "times don't work",
+        "times dont work", "something came up", "family emergency",
+        "cancel my appointment", "cancel the appointment", "cancel my call",
+        "cancel the call",
+    )
+    if any(p in text for p in reschedule):
+        return "rescheduling"
+
+    cancellation = (
+        "cancel my membership", "cancel my subscription", "cancel my program",
+        "cancel my programme", "cancel my plan", "cancel my account",
+        "cancel participation", "can't join", "cannot join", "quit the program",
+    )
+    if any(p in text for p in cancellation):
+        return "cancellation"
+
+    technical = (
+        "link doesn't work", "link does not work", "link isn't working",
+        "broken link", "page won't load", "page will not load", "can't log",
+        "cannot log", "login", "password", "access my", "watch on my tv",
+        "watch it on my tv", "error message",
+    )
+    if any(p in text for p in technical):
+        return "technical"
+
+    scheduling = (
+        "book", "schedule", "appointment", "consultation", "talk to a coach",
+        "speak to a coach", "call with", "set up a time", "available",
+        "availability",
+    )
+    weekday = any(day in text for day in (
+        "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"
+    ))
+    has_time = any(marker in text for marker in (":00", ":30", " am", " pm", "morning", "afternoon", "evening"))
+    if any(p in text for p in scheduling) or (weekday and has_time):
+        return "scheduling"
+
+    coaching = (
+        "meal plan", "nutrition", "workout", "protein", "calories", "coach",
+        "superfoods", "diet", "supplement", "pre-workout", "weigh",
+        "weight", "hormonal profile",
+    )
+    if any(p in text for p in coaching):
+        return "coaching_checkin"
+
+    return "other"
 
 
 def polite_sleep() -> None:
@@ -272,10 +358,15 @@ def fetch_lead_thread(client: CloseClient, lead_id: str) -> list[dict[str, Any]]
     return sorted(rows, key=lambda row: parse_ts(sms_time(row)))
 
 
-def around_send_context(thread: list[dict[str, Any]], outbound_idx: int) -> list[dict[str, str]]:
+def context_bounds(thread: list[dict[str, Any]], outbound_idx: int) -> tuple[int, int]:
     start = max(0, outbound_idx - (THREAD_WINDOW // 2))
     end = min(len(thread), start + THREAD_WINDOW)
     start = max(0, end - THREAD_WINDOW)
+    return start, end
+
+
+def around_send_context(thread: list[dict[str, Any]], outbound_idx: int) -> list[dict[str, str]]:
+    start, end = context_bounds(thread, outbound_idx)
     out = []
     for sms in thread[start:end]:
         out.append(
@@ -288,16 +379,16 @@ def around_send_context(thread: list[dict[str, Any]], outbound_idx: int) -> list
     return out
 
 
-def build_record(client: CloseClient, outbound: dict[str, Any]) -> dict[str, Any] | None:
+def build_records(client: CloseClient, outbound: dict[str, Any]) -> list[dict[str, Any]]:
     lead_id = outbound.get("lead_id")
     outbound_id = outbound.get("id")
     if not lead_id or not outbound_id:
-        return None
+        return []
 
     thread = fetch_lead_thread(client, lead_id)
     outbound_idx = next((i for i, sms in enumerate(thread) if sms.get("id") == outbound_id), None)
     if outbound_idx is None:
-        return None
+        return []
 
     outbound_dt = parse_ts(sms_time(thread[outbound_idx]))
     prior_inbound = None
@@ -306,20 +397,31 @@ def build_record(client: CloseClient, outbound: dict[str, Any]) -> dict[str, Any
             prior_inbound = sms
             break
     if prior_inbound is None:
-        return None
+        return []
 
-    return {
-        "message_id": prior_inbound.get("id") or "",
-        "channel": "sms",
-        "source": "close",
-        "sender": lead_phone(prior_inbound),
-        "body": sms_body(prior_inbound),
-        "timestamp": sms_time(prior_inbound),
-        "thread_context": around_send_context(thread, outbound_idx),
-        "setter_sent_link_after": True,
-        "notes": "",
-        "true_intent_suggestion": "scheduling",
-    }
+    context = around_send_context(thread, outbound_idx)
+    start, end = context_bounds(thread, outbound_idx)
+    records: list[dict[str, Any]] = []
+    for sms in thread[start:end]:
+        if sms_direction(sms) != "inbound":
+            continue
+        body = sms_body(sms)
+        sms_dt = parse_ts(sms_time(sms))
+        records.append(
+            {
+                "message_id": sms.get("id") or "",
+                "channel": "sms",
+                "source": "close",
+                "sender": lead_phone(sms),
+                "body": body,
+                "timestamp": sms_time(sms),
+                "thread_context": context,
+                "setter_sent_link_after": sms_dt <= outbound_dt,
+                "notes": "",
+                "true_intent_suggestion": suggest_intent(body),
+            }
+        )
+    return records
 
 
 def mine_records(client: CloseClient, limit: int, offset: int) -> tuple[list[dict[str, Any]], str]:
@@ -371,14 +473,17 @@ def export(limit: int, offset: int, out_path: Path) -> list[dict[str, Any]]:
     api_key = read_close_api_key()
     client = CloseClient(api_key)
     records: list[dict[str, Any]] = []
+    seen_message_ids: set[str] = set()
     try:
         outbound_matches, phrase = mine_records(client, limit, offset)
         print(f"Outbound matches selected: {len(outbound_matches)} using phrase {phrase!r}")
         for i, outbound in enumerate(outbound_matches, start=1):
             try:
-                record = build_record(client, outbound)
-                if record is not None:
-                    records.append(record)
+                for record in build_records(client, outbound):
+                    message_id = record.get("message_id")
+                    if message_id and message_id not in seen_message_ids:
+                        records.append(record)
+                        seen_message_ids.add(message_id)
             except Exception as exc:  # noqa: BLE001
                 outbound_id = outbound.get("id", "<unknown>")
                 print(f"thread skipped {outbound_id}: {type(exc).__name__}: {exc}", file=sys.stderr)
