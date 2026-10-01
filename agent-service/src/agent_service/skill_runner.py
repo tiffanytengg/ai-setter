@@ -147,6 +147,10 @@ def plan(classification, message):
     # Forced shadow (demo/rehearsal): keep the full action plan as built, but
     # downgrade so execute_plan() never touches the gateways.
     if os.environ.get("AGENT_FORCE_SHADOW") == "true":
+        planned["shadowed_from_active"] = True
+        planned["would_send_before_shadow"] = True
+        planned["send_tool_before_shadow"] = ACTIVE_SEND_TOOL
+        planned["mode_before_shadow"] = "active"
         planned["mode"] = "shadow"
         planned["would_send"] = False
         planned["send_tool"] = None

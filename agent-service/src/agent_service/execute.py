@@ -25,6 +25,50 @@ def _template_for(skill: str | None) -> str:
     return "booking" if skill == "send-booking-link" else "reschedule"
 
 
+def _recipient_for(message: dict) -> str:
+    message = message or {}
+    return message.get("contact_id") or message.get("sender", "")
+
+
+def render_send_preview(planned: dict, message: dict) -> dict:
+    """Render the exact SMS preview for a forced-shadow active plan.
+
+    This is read-only: it calls close-gateway.render_template and never calls
+    send_sms. The returned dict is safe to include in webhook responses and
+    decision logs.
+    """
+    def _out(rendered, reason, body=None):
+        return {
+            "rendered": rendered,
+            "reason": reason,
+            "recipient": _recipient_for(message),
+            "template": _template_for((planned or {}).get("skill")),
+            "render_tool": "close.render_template",
+            "send_tool": (planned or {}).get("send_tool_before_shadow") or "ghl.send_sms",
+            "body": body,
+        }
+
+    planned = planned or {}
+    message = message or {}
+    if not planned.get("shadowed_from_active"):
+        return _out(False, "not a forced-shadow active plan")
+    if not close_gateway.configured:
+        return _out(False, "close-gateway not configured (CLOSE_GATEWAY_URL unset)")
+
+    template = _template_for(planned.get("skill"))
+    sender = message.get("sender", "")
+    try:
+        rendered = call_tool_sync(
+            close_gateway, "render_template",
+            {"template": template, "lead_id": sender, "booking_link": ""},
+        )
+    except GatewayError as exc:
+        return _out(False, f"render failed: {exc}")
+    if not isinstance(rendered, str) or not rendered.strip():
+        return _out(False, "booking link unresolvable — escalated, never invent a link")
+    return _out(True, "rendered via close-gateway.render_template", rendered.strip())
+
+
 def execute_plan(planned: dict, message: dict) -> dict:
     """Attempt to execute an active send plan via the MCP gateways.
 
@@ -50,7 +94,7 @@ def execute_plan(planned: dict, message: dict) -> dict:
     skill = planned.get("skill")
     template = _template_for(skill)
     sender = message.get("sender", "")
-    contact_id = message.get("contact_id") or sender
+    contact_id = _recipient_for(message)
 
     # 1. Render (read-only). Empty string = link unresolvable -> escalate.
     try:

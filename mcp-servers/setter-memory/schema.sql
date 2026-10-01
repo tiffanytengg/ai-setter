@@ -35,10 +35,25 @@ CREATE TABLE IF NOT EXISTS decisions (
     confidence  DOUBLE PRECISION NOT NULL,     -- classifier confidence in [0, 1]
     reasoning   TEXT NOT NULL,                 -- free-text: why this decision
     skill       TEXT,                          -- skill that fired, NULL if none
+    mode        TEXT,                          -- active, shadow, or none
+    would_send  BOOLEAN,                       -- false in forced shadow
+    send_tool   TEXT,                          -- populated only for executable plans
+    escalation_note TEXT,                      -- safety downgrade or reviewer note
     action_taken TEXT NOT NULL,                -- e.g. 'sent_sms', 'shadow_logged',
                                                --      'dropped_opt_out', 'none'
+    action_plan JSONB,                         -- planned steps shown to the user/reviewer
+    execution   JSONB,                         -- execution/safety outcome
+    send_preview JSONB,                        -- rendered body + recipient in forced shadow
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+ALTER TABLE decisions ADD COLUMN IF NOT EXISTS mode TEXT;
+ALTER TABLE decisions ADD COLUMN IF NOT EXISTS would_send BOOLEAN;
+ALTER TABLE decisions ADD COLUMN IF NOT EXISTS send_tool TEXT;
+ALTER TABLE decisions ADD COLUMN IF NOT EXISTS escalation_note TEXT;
+ALTER TABLE decisions ADD COLUMN IF NOT EXISTS action_plan JSONB;
+ALTER TABLE decisions ADD COLUMN IF NOT EXISTS execution JSONB;
+ALTER TABLE decisions ADD COLUMN IF NOT EXISTS send_preview JSONB;
 
 -- Latest-decision lookup per message (what get_state reads).
 CREATE INDEX IF NOT EXISTS decisions_message_created_idx

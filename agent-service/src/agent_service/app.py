@@ -9,7 +9,7 @@ POST /webhook/message  (called by thin n8n WF-01)
   5. decision logged: Postgres (setter-memory schema) when DATABASE_URL is
      set, else JSON to stdout. Logging never breaks the pipeline.
   6. returns {message_id, intent, confidence, reasoning, skill, mode,
-     action_plan, would_send, send_tool}
+     action_plan, would_send, send_tool, execution, send_preview}
 
 The agent service NEVER sends anything. Sends only happen inside the
 ghl-gateway MCP server, behind its own two gates. close-gateway is
@@ -44,7 +44,7 @@ from agent_service.prepass import check as prepass_check
 from agent_service.relevance import is_scheduling_related
 from agent_service.classifier import classify
 from agent_service.skill_runner import plan as skill_plan
-from agent_service.execute import execute_plan
+from agent_service.execute import execute_plan, render_send_preview
 
 log = logging.getLogger("agent_service")
 
@@ -148,9 +148,14 @@ def log_decision(message: dict, result: dict) -> None:
         "reasoning": result.get("reasoning"),
         "skill": result.get("skill"),
         "mode": result.get("mode"),
+        "would_send": result.get("would_send"),
+        "send_tool": result.get("send_tool"),
+        "escalation_note": result.get("escalation_note"),
         "action_taken": _action_taken(result.get("mode") or "none",
                                       bool(result.get("would_send"))),
+        "action_plan": result.get("action_plan"),
         "execution": result.get("execution"),
+        "send_preview": result.get("send_preview"),
     }
     db_url = os.environ.get("DATABASE_URL")
     if not db_url:
@@ -158,10 +163,18 @@ def log_decision(message: dict, result: dict) -> None:
         return
     try:
         import psycopg  # deferred: optional dependency
+        from psycopg.types.json import Json
 
         received_at = _parse_ts(message.get("timestamp"))
         with psycopg.connect(db_url) as conn:
             with conn.cursor() as cur:
+                cur.execute("ALTER TABLE decisions ADD COLUMN IF NOT EXISTS mode TEXT")
+                cur.execute("ALTER TABLE decisions ADD COLUMN IF NOT EXISTS would_send BOOLEAN")
+                cur.execute("ALTER TABLE decisions ADD COLUMN IF NOT EXISTS send_tool TEXT")
+                cur.execute("ALTER TABLE decisions ADD COLUMN IF NOT EXISTS escalation_note TEXT")
+                cur.execute("ALTER TABLE decisions ADD COLUMN IF NOT EXISTS action_plan JSONB")
+                cur.execute("ALTER TABLE decisions ADD COLUMN IF NOT EXISTS execution JSONB")
+                cur.execute("ALTER TABLE decisions ADD COLUMN IF NOT EXISTS send_preview JSONB")
                 cur.execute(
                     """
                     INSERT INTO messages
@@ -176,12 +189,17 @@ def log_decision(message: dict, result: dict) -> None:
                 cur.execute(
                     """
                     INSERT INTO decisions
-                        (id, message_id, intent, confidence, reasoning, skill, action_taken)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s)
+                        (id, message_id, intent, confidence, reasoning, skill,
+                         mode, would_send, send_tool, escalation_note,
+                         action_taken, action_plan, execution, send_preview)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     """,
                     (uuid.uuid4().hex, record["message_id"], record["intent"],
                      record["confidence"], record["reasoning"], record["skill"],
-                     record["action_taken"]),
+                     record["mode"], record["would_send"], record["send_tool"],
+                     record["escalation_note"], record["action_taken"],
+                     Json(record.get("action_plan")),
+                     Json(record.get("execution")), Json(record.get("send_preview"))),
                 )
             conn.commit()
     except Exception as exc:  # noqa: BLE001 — DB failure degrades to stdout
@@ -259,6 +277,12 @@ def handle_message_dict(payload: dict, llm_fn=None) -> dict:
         )
         if planned.get("escalation_note"):
             result["escalation_note"] = planned["escalation_note"]
+        if planned.get("shadowed_from_active"):
+            result["shadowed_from_active"] = True
+            result["would_send_before_shadow"] = planned.get("would_send_before_shadow")
+            result["send_tool_before_shadow"] = planned.get("send_tool_before_shadow")
+            result["mode_before_shadow"] = planned.get("mode_before_shadow")
+            result["send_preview"] = render_send_preview(planned, message)
 
         # 5. Execute active plans through the MCP gateways (fail-closed:
         #    unconfigured gateways, empty renders, and gateway refusals all

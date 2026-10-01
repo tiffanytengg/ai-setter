@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Sweep the offline classifier over mined Close records.
+"""Sweep the classifier over mined Close records.
 
-Offline only: imports agent_service.classifier.classify with llm_fn=None.
-The input/output files may contain PII; do not commit generated JSON.
+Default mode is the offline keyword baseline. With --llm, the script injects
+the same Anthropic-backed llm_fn shape the service uses, which makes network
+calls and requires ANTHROPIC_API_KEY. The input/output files may contain PII;
+do not commit generated JSON.
 """
 
 from __future__ import annotations
@@ -11,6 +13,7 @@ import argparse
 import json
 import os
 import sys
+import time
 from collections import Counter, defaultdict
 from pathlib import Path
 from statistics import mean
@@ -21,6 +24,7 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_IN = ROOT / "eval" / "fixtures" / "golden_mined.json"
 DEFAULT_OUT = ROOT / "eval" / "results" / "sweep.json"
 LABELS_PATH = ROOT / "eval" / "labels.json"
+DEFAULT_MODEL = "claude-haiku-4-5"
 INTENTS = (
     "scheduling",
     "rescheduling",
@@ -39,6 +43,46 @@ def load_classifier():
     from agent_service.classifier import classify
 
     return classify
+
+
+def load_env_file(path: Path) -> None:
+    if not path.exists():
+        return
+    with path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+
+
+def make_anthropic_llm_fn(model: str, delay_s: float = 0.0):
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        raise SystemExit("ANTHROPIC_API_KEY is not set")
+
+    import anthropic
+
+    client = anthropic.Anthropic(api_key=api_key)
+
+    def _call(prompt: str) -> str:
+        if delay_s:
+            time.sleep(delay_s)
+        resp = client.messages.create(
+            model=model,
+            max_tokens=300,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return "".join(
+            block.text for block in resp.content
+            if getattr(block, "type", None) == "text"
+        )
+
+    return _call
 
 
 def load_records(path: Path) -> list[dict[str, Any]]:
@@ -120,12 +164,12 @@ def confidence_bucket(conf: float) -> str:
     return ">=0.9"
 
 
-def run_sweep(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def run_sweep(records: list[dict[str, Any]], llm_fn=None) -> list[dict[str, Any]]:
     classify = load_classifier()
     results = []
     for row in records:
         message = canonical(row)
-        decision = classify(message) or {}
+        decision = classify(message, llm_fn=llm_fn) or {}
         confidence = float(decision.get("confidence") or 0.0)
         results.append(
             {
@@ -237,12 +281,14 @@ def print_summary(results: list[dict[str, Any]]) -> None:
         print("\n".join(section))
 
 
-def save_results(path: Path, input_path: Path, results: list[dict[str, Any]]) -> None:
+def save_results(path: Path, input_path: Path, results: list[dict[str, Any]], classifier_mode: str, model: str | None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as fh:
         json.dump(
             {
                 "input": str(input_path),
+                "classifier_mode": classifier_mode,
+                "model": model,
                 "deduped_count": len(results),
                 "results": results,
             },
@@ -257,14 +303,27 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--in", dest="in_path", default=str(DEFAULT_IN))
     parser.add_argument("--out", dest="out_path", default=str(DEFAULT_OUT))
+    parser.add_argument("--llm", action="store_true", help="Use Anthropic LLM classifier path instead of keyword baseline.")
+    parser.add_argument("--model", default=None, help="Anthropic model for --llm (default: AGENT_LLM_MODEL or claude-haiku-4-5).")
+    parser.add_argument("--env-file", default=str(ROOT / "agent-service" / ".env"))
+    parser.add_argument("--delay", type=float, default=0.0, help="Seconds to sleep between LLM calls.")
     args = parser.parse_args(argv)
 
     in_path = Path(args.in_path)
     out_path = Path(args.out_path)
     records = load_records(in_path)
     merge_labels(records, load_labels())
-    results = run_sweep(records)
-    save_results(out_path, in_path, results)
+    llm_fn = None
+    classifier_mode = "keyword"
+    model = None
+    if args.llm:
+        load_env_file(Path(args.env_file))
+        model = args.model or os.environ.get("AGENT_LLM_MODEL") or DEFAULT_MODEL
+        llm_fn = make_anthropic_llm_fn(model, delay_s=args.delay)
+        classifier_mode = "llm"
+    results = run_sweep(records, llm_fn=llm_fn)
+    save_results(out_path, in_path, results, classifier_mode, model)
+    print(f"Classifier mode: {classifier_mode}" + (f" ({model})" if model else ""))
     print_summary(results)
     print()
     print(f"Saved full local results to {out_path}")
