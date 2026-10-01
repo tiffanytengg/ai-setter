@@ -20,6 +20,7 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_IN = ROOT / "eval" / "fixtures" / "golden_mined.json"
 DEFAULT_OUT = ROOT / "eval" / "results" / "sweep.json"
+LABELS_PATH = ROOT / "eval" / "labels.json"
 INTENTS = (
     "scheduling",
     "rescheduling",
@@ -57,6 +58,36 @@ def load_records(path: Path) -> list[dict[str, Any]]:
         seen.add(message_id)
         deduped.append(row)
     return deduped
+
+
+def load_labels(path: Path = LABELS_PATH) -> dict[str, dict[str, str]]:
+    if not path.exists():
+        return {}
+    with path.open("r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    if not isinstance(data, dict):
+        raise SystemExit(f"labels file must be an object: {path}")
+    labels: dict[str, dict[str, str]] = {}
+    for message_id, label in data.items():
+        if not isinstance(label, dict):
+            continue
+        true_intent = str(label.get("true_intent") or "").strip()
+        if not true_intent:
+            continue
+        labels[str(message_id)] = {
+            "true_intent": true_intent,
+            "notes": str(label.get("notes") or ""),
+        }
+    return labels
+
+
+def merge_labels(records: list[dict[str, Any]], labels: dict[str, dict[str, str]]) -> None:
+    for row in records:
+        label = labels.get(str(row.get("message_id") or ""))
+        if not label:
+            continue
+        row["true_intent"] = label["true_intent"]
+        row["notes"] = label.get("notes", "")
 
 
 def canonical(row: dict[str, Any]) -> dict[str, Any]:
@@ -231,6 +262,7 @@ def main(argv: list[str] | None = None) -> int:
     in_path = Path(args.in_path)
     out_path = Path(args.out_path)
     records = load_records(in_path)
+    merge_labels(records, load_labels())
     results = run_sweep(records)
     save_results(out_path, in_path, results)
     print_summary(results)

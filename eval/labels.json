@@ -1,0 +1,18 @@
+{
+  "acti_4AWF72ZZjDw8sqqm8qGkKbrAYX2cRfttaxQW92SSKcE": {
+    "true_intent": "opt_out",
+    "notes": ""
+  },
+  "acti_CW7KSZp31j6pjhgky5Rilvi7qQfb3y3YLDxo805ofRL": {
+    "true_intent": "rescheduling",
+    "notes": ""
+  },
+  "acti_jATmh6aftv1Q3SOrCpINizzRHouMiCxKCC0F9i4t4Pk": {
+    "true_intent": "scheduling",
+    "notes": ""
+  },
+  "acti_yAEZkejhKQKJLGAPVcdofVDQR3xXgKR15scjdMtzUST": {
+    "true_intent": "rescheduling",
+    "notes": ""
+  }
+}

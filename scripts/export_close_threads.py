@@ -22,6 +22,7 @@ import httpx
 
 ROOT = Path(__file__).resolve().parents[1]
 ENV_PATH = ROOT / "mcp-servers" / "close-gateway" / ".env"
+LABELS_PATH = ROOT / "eval" / "labels.json"
 CLOSE_BASE = "https://api.close.com/api/v1"
 
 PHRASES = [
@@ -61,6 +62,38 @@ def read_close_api_key(path: Path = ENV_PATH) -> str:
                 if value:
                     return value
     raise CloseExportError(f"CLOSE_API_KEY not found in {path}")
+
+
+def load_labels(path: Path = LABELS_PATH) -> dict[str, dict[str, str]]:
+    """Read hand labels. This script never writes this file."""
+    if not path.exists():
+        return {}
+    with path.open("r", encoding="utf-8") as fh:
+        data = json.load(fh)
+    if not isinstance(data, dict):
+        raise CloseExportError(f"labels file must be an object: {path}")
+    labels: dict[str, dict[str, str]] = {}
+    for message_id, label in data.items():
+        if not isinstance(label, dict):
+            continue
+        true_intent = str(label.get("true_intent") or "").strip()
+        if not true_intent:
+            continue
+        labels[str(message_id)] = {
+            "true_intent": true_intent,
+            "notes": str(label.get("notes") or ""),
+        }
+    return labels
+
+
+def merge_labels(records: list[dict[str, Any]], labels: dict[str, dict[str, str]]) -> None:
+    """Apply hand labels in-place. Labels win over generated suggestions."""
+    for record in records:
+        label = labels.get(str(record.get("message_id") or ""))
+        if not label:
+            continue
+        record["true_intent"] = label["true_intent"]
+        record["notes"] = label.get("notes", "")
 
 
 def parse_ts(value: str | None) -> datetime:
@@ -471,6 +504,7 @@ def mine_records(client: CloseClient, limit: int, offset: int) -> tuple[list[dic
 
 def export(limit: int, offset: int, out_path: Path) -> list[dict[str, Any]]:
     api_key = read_close_api_key()
+    labels = load_labels()
     client = CloseClient(api_key)
     records: list[dict[str, Any]] = []
     seen_message_ids: set[str] = set()
@@ -493,6 +527,7 @@ def export(limit: int, offset: int, out_path: Path) -> list[dict[str, Any]]:
     finally:
         client.close()
 
+    merge_labels(records, labels)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     with out_path.open("w", encoding="utf-8") as fh:
         json.dump({"messages": records}, fh, indent=2, ensure_ascii=False)
